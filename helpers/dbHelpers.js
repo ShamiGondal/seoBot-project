@@ -1,5 +1,7 @@
 const TrafficData = require('../models/trafficData');
 const WebsiteMetadata = require('../models/websiteMetadata');
+const User = require('../models/user');
+const Payment = require('../models/payment');
 
 const storeTrafficData = async ({ userId, keyword, website, country, rank = 0, hits = 0 }) => {
     try {
@@ -136,6 +138,188 @@ const deleteWebsiteMetadata = async (userId, website, keyword) => {
     }
 };
 
+// Credit Management Functions
+const CREDITS_PER_REQUEST = 10;
+
+const checkAndDeductCredits = async (userId, requestType = 'campaign') => {
+    try {
+        const user = await User.findById(userId);
+        if (!user) {
+            throw new Error('User not found');
+        }
+
+        // Reset daily requests if it's a new day
+        const today = new Date().toDateString();
+        const lastReset = user.lastResetDate?.toDateString();
+        if (lastReset !== today) {
+            user.dailyRequestsUsed = 0;
+            user.lastResetDate = new Date();
+        }
+
+        // Check daily limit for free users
+        if (user.planType === 'free' && user.dailyRequestsUsed >= user.dailyRequestLimit) {
+            throw new Error('Daily request limit reached. Please upgrade your plan or try again tomorrow.');
+        }
+
+        // Check if user has enough credits
+        if (user.credits < CREDITS_PER_REQUEST && user.planType !== 'unlimited') {
+            throw new Error('Insufficient credits. Please purchase more credits or upgrade your plan.');
+        }
+
+        // Deduct credits (skip for unlimited plan)
+        if (user.planType !== 'unlimited') {
+            user.credits -= CREDITS_PER_REQUEST;
+            user.totalCreditsUsed += CREDITS_PER_REQUEST;
+        }
+
+        // Increment daily requests
+        user.dailyRequestsUsed += 1;
+        await user.save();
+
+        return {
+            success: true,
+            remainingCredits: user.credits,
+            dailyRequestsRemaining: user.dailyRequestLimit - user.dailyRequestsUsed
+        };
+    } catch (error) {
+        console.error('Error checking and deducting credits:', error);
+        throw error;
+    }
+};
+
+const addCredits = async (userId, credits, planType = null) => {
+    try {
+        const user = await User.findById(userId);
+        if (!user) {
+            throw new Error('User not found');
+        }
+
+        user.credits += credits;
+        
+        if (planType && planType !== 'free') {
+            user.planType = planType;
+            user.isPaymentActive = true;
+            
+            // Set plan expiry date (30 days from now)
+            const expiryDate = new Date();
+            expiryDate.setDate(expiryDate.getDate() + 30);
+            user.paymentExpiryDate = expiryDate;
+            
+            // Set plan-specific details
+            const planDetails = getPlanDetails(planType);
+            user.planPrice = planDetails.price;
+            user.planCredits = credits;
+            
+            // Update daily limits based on plan
+            if (planType === 'unlimited') {
+                user.dailyRequestLimit = 999999; // Effectively unlimited
+            } else {
+                user.dailyRequestLimit = 50; // Higher limit for paid plans
+            }
+        }
+
+        await user.save();
+        return user;
+    } catch (error) {
+        console.error('Error adding credits:', error);
+        throw error;
+    }
+};
+
+const getUserCredits = async (userId) => {
+    try {
+        const user = await User.findById(userId).select('credits totalCreditsUsed planType dailyRequestLimit dailyRequestsUsed lastResetDate isPaymentActive paymentExpiryDate');
+        if (!user) {
+            throw new Error('User not found');
+        }
+
+        // Reset daily requests if it's a new day
+        const today = new Date().toDateString();
+        const lastReset = user.lastResetDate?.toDateString();
+        if (lastReset !== today) {
+            user.dailyRequestsUsed = 0;
+            user.lastResetDate = new Date();
+            await user.save();
+        }
+
+        return {
+            credits: user.credits,
+            totalCreditsUsed: user.totalCreditsUsed,
+            planType: user.planType,
+            dailyRequestLimit: user.dailyRequestLimit,
+            dailyRequestsUsed: user.dailyRequestsUsed,
+            dailyRequestsRemaining: user.dailyRequestLimit - user.dailyRequestsUsed,
+            isPaymentActive: user.isPaymentActive,
+            paymentExpiryDate: user.paymentExpiryDate
+        };
+    } catch (error) {
+        console.error('Error getting user credits:', error);
+        throw error;
+    }
+};
+
+const getPlanDetails = (planType) => {
+    const plans = {
+        free: { credits: 50, price: 0, dailyLimit: 5 },
+        basic: { credits: 4000, price: 2000, dailyLimit: 50 },
+        premium: { credits: 10000, price: 4000, dailyLimit: 100 },
+        unlimited: { credits: -1, price: 7500, dailyLimit: 999999 }
+    };
+    return plans[planType] || plans.free;
+};
+
+const createPaymentRecord = async (userId, planType, credits, amount, paymentData = {}) => {
+    try {
+        const payment = new Payment({
+            userId,
+            planType,
+            creditsPurchased: credits,
+            pricePaid: amount,
+            paymentId: paymentData.paymentId || null,
+            paymentStatus: paymentData.status || 'pending',
+            paymentMethod: paymentData.method || 'online',
+            transactionId: paymentData.transactionId || null,
+            gatewayResponse: paymentData.gatewayResponse || {},
+            expiryDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) // 30 days
+        });
+
+        await payment.save();
+        return payment;
+    } catch (error) {
+        console.error('Error creating payment record:', error);
+        throw error;
+    }
+};
+
+const updatePaymentStatus = async (paymentId, status, gatewayResponse = {}) => {
+    try {
+        const payment = await Payment.findOneAndUpdate(
+            { paymentId },
+            { 
+                paymentStatus: status,
+                gatewayResponse: gatewayResponse
+            },
+            { new: true }
+        );
+        return payment;
+    } catch (error) {
+        console.error('Error updating payment status:', error);
+        throw error;
+    }
+};
+
+const getUserPaymentHistory = async (userId) => {
+    try {
+        const payments = await Payment.find({ userId })
+            .sort({ createdAt: -1 })
+            .select('planType creditsPurchased pricePaid paymentStatus paymentDate expiryDate');
+        return payments;
+    } catch (error) {
+        console.error('Error getting payment history:', error);
+        throw error;
+    }
+};
+
 module.exports = {
     storeTrafficData,
     updateTrafficDataHits,
@@ -144,5 +328,14 @@ module.exports = {
     updateTrafficDataWithSEO,
     getWebsiteMetadata,
     getAllUserMetadata,
-    deleteWebsiteMetadata
+    deleteWebsiteMetadata,
+    // Credit management
+    checkAndDeductCredits,
+    addCredits,
+    getUserCredits,
+    getPlanDetails,
+    createPaymentRecord,
+    updatePaymentStatus,
+    getUserPaymentHistory,
+    CREDITS_PER_REQUEST
 };

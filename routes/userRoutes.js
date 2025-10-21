@@ -9,8 +9,17 @@ const {
     updateTrafficDataWithSEO, 
     getWebsiteMetadata, 
     getAllUserMetadata, 
-    deleteWebsiteMetadata 
+    deleteWebsiteMetadata,
+    checkAndDeductCredits,
+    addCredits,
+    getUserCredits,
+    getPlanDetails,
+    createPaymentRecord,
+    updatePaymentStatus,
+    getUserPaymentHistory,
+    CREDITS_PER_REQUEST
 } = require('../helpers/dbHelpers');
+const Payment = require('../models/payment');
 
 const router = express.Router();
 
@@ -87,13 +96,16 @@ router.post('/subscribe', authenticate, async (req, res) => {
     const { planType } = req.body;
     const userId = req.user.id;
 
-    const validPlans = ['free','plan1', 'plan2'];
+    const validPlans = ['free', 'basic', 'premium', 'unlimited'];
     if (!validPlans.includes(planType)) {
         return res.status(400).send('Invalid plan type');
     }
 
     try {
-        await User.findByIdAndUpdate(userId, { subscription: planType });
+        await User.findByIdAndUpdate(userId, { 
+            subscription: planType,
+            planType: planType
+        });
         res.status(200).send({ message: 'Subscription updated successfully' });
     } catch (error) {
         res.status(400).send(error.message);
@@ -299,6 +311,177 @@ router.get('/seo-analytics', authenticate, async (req, res) => {
         };
 
         res.status(200).send(analytics);
+    } catch (error) {
+        res.status(400).send(error.message);
+    }
+});
+
+// Payment and Credit Management Routes
+
+// Get user credits and plan information
+router.get('/credits', authenticate, async (req, res) => {
+    const userId = req.user.id;
+
+    try {
+        const creditsInfo = await getUserCredits(userId);
+        const planDetails = getPlanDetails(creditsInfo.planType);
+        
+        res.status(200).send({
+            ...creditsInfo,
+            planDetails,
+            creditsPerRequest: CREDITS_PER_REQUEST
+        });
+    } catch (error) {
+        res.status(400).send(error.message);
+    }
+});
+
+// Get available plans
+router.get('/plans', authenticate, async (req, res) => {
+    try {
+        const plans = {
+            free: {
+                name: 'Free',
+                price: 0,
+                credits: 50,
+                dailyLimit: 5,
+                description: 'Perfect for testing'
+            },
+            basic: {
+                name: 'Basic',
+                price: 2000,
+                credits: 4000,
+                dailyLimit: 50,
+                description: 'Great for small businesses'
+            },
+            premium: {
+                name: 'Premium',
+                price: 4000,
+                credits: 10000,
+                dailyLimit: 100,
+                description: 'Perfect for growing businesses'
+            },
+            unlimited: {
+                name: 'Unlimited',
+                price: 7500,
+                credits: -1,
+                dailyLimit: 999999,
+                description: 'For serious marketers'
+            }
+        };
+
+        res.status(200).send(plans);
+    } catch (error) {
+        res.status(400).send(error.message);
+    }
+});
+
+// Create payment intent (simulate payment initiation)
+router.post('/create-payment', authenticate, async (req, res) => {
+    const userId = req.user.id;
+    const { planType } = req.body;
+
+    const validPlans = ['basic', 'premium', 'unlimited'];
+    if (!validPlans.includes(planType)) {
+        return res.status(400).send('Invalid plan type');
+    }
+
+    try {
+        const planDetails = getPlanDetails(planType);
+        const paymentId = `pay_${Date.now()}_${userId}`;
+        
+        // Create payment record
+        const payment = await createPaymentRecord(
+            userId,
+            planType,
+            planDetails.credits,
+            planDetails.price,
+            {
+                paymentId,
+                status: 'pending',
+                method: 'online'
+            }
+        );
+
+        res.status(200).send({
+            paymentId,
+            amount: planDetails.price,
+            credits: planDetails.credits,
+            planType,
+            message: 'Payment created successfully'
+        });
+    } catch (error) {
+        res.status(400).send(error.message);
+    }
+});
+
+// Confirm payment (simulate payment completion)
+router.post('/confirm-payment', authenticate, async (req, res) => {
+    const userId = req.user.id;
+    const { paymentId, transactionId } = req.body;
+
+    if (!paymentId) {
+        return res.status(400).send('Payment ID is required');
+    }
+
+    try {
+        // Find the payment record
+        const payment = await Payment.findOne({ paymentId, userId });
+        if (!payment) {
+            return res.status(404).send('Payment not found');
+        }
+
+        if (payment.paymentStatus === 'completed') {
+            return res.status(400).send('Payment already completed');
+        }
+
+        // Update payment status
+        await updatePaymentStatus(paymentId, 'completed', {
+            transactionId,
+            confirmedAt: new Date()
+        });
+
+        // Add credits to user account
+        await addCredits(userId, payment.creditsPurchased, payment.planType);
+
+        res.status(200).send({
+            message: 'Payment confirmed successfully',
+            creditsAdded: payment.creditsPurchased,
+            planType: payment.planType
+        });
+    } catch (error) {
+        res.status(400).send(error.message);
+    }
+});
+
+// Get payment history
+router.get('/payment-history', authenticate, async (req, res) => {
+    const userId = req.user.id;
+
+    try {
+        const payments = await getUserPaymentHistory(userId);
+        res.status(200).send(payments);
+    } catch (error) {
+        res.status(400).send(error.message);
+    }
+});
+
+// Check if user can create campaign (credit check)
+router.get('/can-create-campaign', authenticate, async (req, res) => {
+    const userId = req.user.id;
+
+    try {
+        const creditsInfo = await getUserCredits(userId);
+        
+        const canCreate = creditsInfo.credits >= CREDITS_PER_REQUEST || creditsInfo.planType === 'unlimited';
+        const hasDailyLimit = creditsInfo.dailyRequestsRemaining > 0;
+
+        res.status(200).send({
+            canCreate: canCreate && hasDailyLimit,
+            reason: !canCreate ? 'Insufficient credits' : !hasDailyLimit ? 'Daily limit reached' : null,
+            creditsInfo,
+            creditsRequired: CREDITS_PER_REQUEST
+        });
     } catch (error) {
         res.status(400).send(error.message);
     }

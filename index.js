@@ -6,7 +6,7 @@ const { generateTraffic, findWebsiteByKeyword } = require('./bot');
 const userRoutes = require('./routes/userRoutes');
 const { authenticate } = require('./middleware/authMiddleware');
 const { addTaskToQueue, processQueue } = require('./queue');
-const { storeTrafficData, updateTrafficDataRank, updateTrafficDataHits } = require('./helpers/dbHelpers');
+const { storeTrafficData, updateTrafficDataRank, updateTrafficDataHits, checkAndDeductCredits, getPlanDetails } = require('./helpers/dbHelpers');
 const User = require('./models/user');
 const TrafficData = require('./models/trafficData');
 
@@ -25,13 +25,12 @@ app.use(bodyParser.json());
 
 app.use('/api/users', userRoutes);
 
-const subscriptions = {
+// Legacy subscriptions for backward compatibility - now using credit system
+const legacySubscriptions = {
     free: { hitsPerDay: 10, durationDays: Infinity },
     plan1: { hitsPerDay: 3000, durationDays: 7 },
     plan2: { hitsPerDay: 500, durationDays: 30 }
 };
-
-const getPlanDetails = (planType) => subscriptions[planType];
 
 const getTotalSecondsInDay = () => 24 * 60 * 60;
 
@@ -65,27 +64,63 @@ app.post('/api/users/generate-traffic-by-subscription', authenticate, async (req
     }
 
     try {
+        // Check and deduct credits before creating campaign
+        const creditCheck = await checkAndDeductCredits(userId, 'campaign');
+        if (!creditCheck.success) {
+            return res.status(403).send(creditCheck.message || 'Insufficient credits or daily limit reached');
+        }
+
         const user = await User.findById(userId);
-        if (!user || !user.subscription) {
-            return res.status(403).send('No active subscription found for user');
+        if (!user) {
+            return res.status(404).send('User not found');
         }
 
-        const planDetails = getPlanDetails(user.subscription);
+        // Use planType instead of subscription for new credit system
+        const currentPlan = user.planType || 'free';
+        const planDetails = getPlanDetails(currentPlan);
+        
         if (!planDetails) {
-            return res.status(400).send('Invalid subscription plan');
+            return res.status(400).send('Invalid plan configuration');
         }
 
-        const { hitsPerDay, durationDays } = planDetails;
+        // Handle different plans - for new credit system, we'll use default values
+        // The old subscription-based system is being replaced with credit-based system
+        let hitsPerDay, durationDays;
+        
+        if (currentPlan === 'unlimited') {
+            hitsPerDay = 1000; // High limit for unlimited users
+            durationDays = 30;
+        } else if (currentPlan === 'premium') {
+            hitsPerDay = 500;
+            durationDays = 7;
+        } else if (currentPlan === 'basic') {
+            hitsPerDay = 200;
+            durationDays = 7;
+        } else {
+            // Free plan or fallback
+            hitsPerDay = 50;
+            durationDays = 3;
+        }
+
         storeTrafficData({ userId, keyword, website: url, country });
         const isWebsiteFound = await findWebsiteByKeyword({ url, keyword, userId, country });
         if (!isWebsiteFound) {
-           // storeTrafficData({ userId, keyword, website: url, country });
             handleTrafficGeneration(url, keyword, country, userId, hitsPerDay, durationDays);
-            return res.status(201).send({ message: 'Your website was not found in the top 100 search results for the given keyword' });
+            return res.status(201).send({ 
+                message: 'Your website was not found in the top 100 search results for the given keyword',
+                creditsUsed: 10,
+                remainingCredits: creditCheck.remainingCredits,
+                dailyRequestsRemaining: creditCheck.dailyRequestsRemaining
+            });
         }
 
         handleTrafficGeneration(url, keyword, country, userId, hitsPerDay, durationDays);
-        res.status(200).send({ message: 'Traffic generation tasks are being added to the queue' });
+        res.status(200).send({ 
+            message: 'Traffic generation tasks are being added to the queue',
+            creditsUsed: 10,
+            remainingCredits: creditCheck.remainingCredits,
+            dailyRequestsRemaining: creditCheck.dailyRequestsRemaining
+        });
     } catch (error) {
         res.status(500).send(error.message);
     }
