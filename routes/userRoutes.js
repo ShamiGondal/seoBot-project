@@ -454,6 +454,63 @@ router.post('/confirm-payment', authenticate, async (req, res) => {
     }
 });
 
+// Square charge webhook/confirmation (client-side confirmed)
+// Body example: { sourceId: "cnon:...", planType: "basic" }
+router.post('/square-charge', authenticate, async (req, res) => {
+    const userId = req.user.id;
+    const { sourceId, planType } = req.body;
+
+    const validPlans = ['basic', 'premium', 'unlimited'];
+    if (!sourceId) {
+        return res.status(400).send('sourceId is required');
+    }
+    if (!validPlans.includes(planType)) {
+        return res.status(400).send('Invalid plan type');
+    }
+
+    try {
+        // Idempotency: if we already recorded this sourceId as a completed payment, return success
+        const existing = await Payment.findOne({ paymentId: sourceId, userId });
+        if (existing && existing.paymentStatus === 'completed') {
+            // Ensure user has credits applied
+            await addCredits(userId, existing.creditsPurchased, existing.planType);
+            return res.status(200).send({
+                message: 'Payment already recorded',
+                creditsAdded: existing.creditsPurchased,
+                planType: existing.planType
+            });
+        }
+
+        const plan = getPlanDetails(planType);
+
+        // Create payment record as completed (Square already succeeded on client)
+        const payment = await createPaymentRecord(
+            userId,
+            planType,
+            plan.credits,
+            plan.price,
+            {
+                paymentId: sourceId,
+                status: 'completed',
+                method: 'square',
+                transactionId: sourceId,
+                gatewayResponse: { sourceId }
+            }
+        );
+
+        // Add credits to user
+        await addCredits(userId, payment.creditsPurchased, payment.planType);
+
+        res.status(200).send({
+            message: 'Square payment recorded successfully',
+            creditsAdded: payment.creditsPurchased,
+            planType: payment.planType
+        });
+    } catch (error) {
+        res.status(400).send(error.message);
+    }
+});
+
 // Get payment history
 router.get('/payment-history', authenticate, async (req, res) => {
     const userId = req.user.id;
